@@ -1,14 +1,197 @@
-# A fast, small, safe, gradually typed embeddable scripting language derived from Lua
-#
-# https://github.com/luau-lang/luau
-# https://luau.org/
+-- ShotSystem.lua
+-- Author: klyv_e
 
-# Code coverage
-coverage.out
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local ServerStorage = game:GetService("ServerStorage")
 
-# Profiling
-profile.out
-profile.svg
+-- Game settings
+local gameSettings = ReplicatedStorage:WaitForChild("GameSettings")
+local remotes = gameSettings:WaitForChild("Remotes")
+local modules = ServerStorage:WaitForChild("Modules")
 
-# Time trace
-trace.json
+-- Function to get all player components
+local function getCharacterComponents(player)
+    local char = player.Character
+    local humanoid = char and char:FindFirstChild("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local ball = char and char:FindFirstChild("Ball")
+    local values = char and char:FindFirstChild("Values")
+    local shooting = values and values:FindFirstChild("Shooting")
+    local contest = values and values:FindFirstChild("Contest")
+    local scriptsFolder = char and char:FindFirstChild("Scripts")
+    local animations = scriptsFolder and scriptsFolder.Animations.Get:Invoke()
+    return char, humanoid, root, ball, values, shooting, contest, animations
+end
+
+-- Goal module loader
+local function getGoalModule()
+    return require(modules:FindFirstChild("_Goal"))
+end
+
+-- Calculate ball offset based on barsize and percent
+local function calculateOffset(barsize, percent)
+    local max, min = 0, 1.25
+    if barsize > 0.5 then
+        return (percent * (max - min) / 100) + min
+    else
+        return (percent * (max + min) / 100) - min
+    end
+end
+
+-- Calculate percent for shot accuracy
+local function calculatePercent(barsize, contestValue)
+    local adjBarsize = barsize
+    if barsize > 0.5 then
+        adjBarsize = 0.5 - (0.5 - barsize) * -1
+    end
+    local basePercent = (adjBarsize / 0.5) * 100
+    local percent = math.clamp(basePercent + 5 - contestValue, 0, 100)
+    warn("[ PERCENT: "..percent.." ]")
+    return math.floor(percent)
+end
+
+-- Setup BodyGyro to face goal
+local function setupBodyGyro(root, goal)
+    local bg = Instance.new("BodyGyro")
+    bg.Parent = root
+    bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+    bg.D, bg.P = 275, 5000
+    bg.CFrame = CFrame.lookAt(root.Position, Vector3.new(goal.Position.X, root.Position.Y, goal.Position.Z))
+    return bg
+end
+
+-- Ball release function
+local function onRelease(ball, goal, barsize, percent)
+    local magnitude = (ball.Position - goal.Position).Magnitude
+    local t = 1.1 + magnitude / 110
+    local g = Vector3.new(0, -workspace.Gravity / math.pi, 0)
+    local x0 = ball.Position
+    local v0 = (goal.Position - x0 - 0.5 * g * t * t) / t / 1.035
+    local offset = calculateOffset(barsize, percent)
+    ball.Connect.Part0 = nil
+    ball.Parent = workspace
+    ball.Velocity = v0 + Vector3.new(offset, offset, offset)
+    ball:SetNetworkOwner(nil)
+    ball.RotVelocity = Vector3.new(0, 0, 15)
+    wait(1.25)
+    ball.Settings.Welder.Value = ""
+end
+
+-- ShotMeter setup
+local function setupShotMeter(root)
+    local shotmeter = root:FindFirstChild("ShotmeterUI")
+    local meter = shotmeter and shotmeter:FindFirstChild("Meter")
+    local bar = meter and meter:FindFirstChild("Bar")
+    return shotmeter, meter, bar
+end
+
+-- Tween creation for shot meter
+local function createTweens(bar, animationLength)
+    local barTweenInfo = TweenInfo.new(animationLength / 2, Enum.EasingStyle.Linear)
+    local stopTweenInfo = TweenInfo.new(0, Enum.EasingStyle.Linear)
+    local barTween = TweenService:Create(bar, barTweenInfo, {Size = UDim2.new(1,0,-1,0)})
+    local stopTween = TweenService:Create(bar, stopTweenInfo, {Size = UDim2.new(1,0,bar.Size.Y.Scale,0)})
+    return barTween, stopTween
+end
+
+-- Stop dribble animation
+local function stopDribbleAnimations(animations)
+    for _, v in pairs(animations) do
+        if v.Name == "Right-Dribble" then
+            v:Stop()
+        end
+    end
+end
+
+-- Wait until player aligns with goal
+local function waitForAlignment(root, goal)
+    repeat wait() until root.Position:Dot(Vector3.new(goal.Position.X, root.Position.Y, goal.Position.Z))
+end
+
+-- Handle release frame
+local function handleShotRelease(animations, bar, ball, goal, shooting, contest)
+    animations["Jumpshot-1"].KeyframeReached:Connect(function(frame)
+        while frame == "Hold" do wait() end
+        if frame == "Release" then
+            local percent = calculatePercent(-bar.Size.Y.Scale, contest.Value)
+            onRelease(ball, goal, -bar.Size.Y.Scale, percent)
+            shooting.Value = false
+            contest.Value = 0
+        end
+    end)
+end
+
+-- Validate character components
+local function validateCharacterComponents(char, humanoid, root, ball, values, shooting, contest, animations)
+    return char and humanoid and root and ball and values and shooting and contest and animations
+end
+
+-- Validate shotmeter components
+local function validateShotMeterComponents(shotmeter, meter, bar)
+    return shotmeter and meter and bar
+end
+
+-- Reset shot meter
+local function resetShotMeter(bar)
+    bar.Size = UDim2.new(1,0,0,0)
+end
+
+-- Set player walk speed
+local function setPlayerWalkSpeed(humanoid, speed)
+    humanoid.WalkSpeed = speed
+end
+
+-- Cleanup BodyGyro
+local function cleanupBodyGyro(bg)
+    if bg then bg:Destroy() end
+end
+
+-- Process standing shot
+local function processStandingShot(player, char, humanoid, root, ball, values, shooting, contest, animations)
+    local goalModule = getGoalModule()
+    local goal = goalModule:Goal("Goal", root)
+    local shotmeter, meter, bar = setupShotMeter(root)
+    if not validateShotMeterComponents(shotmeter, meter, bar) then return end
+    local animationLength = animations["Jumpshot-1"].Length
+    local barTween, stopTween = createTweens(bar, animationLength)
+    shooting.Value = true
+    stopDribbleAnimations(animations)
+    local bg = setupBodyGyro(root, goal)
+    setPlayerWalkSpeed(humanoid, 0)
+    waitForAlignment(root, goal)
+    animations["Jumpshot-1"]:Play(0.5)
+    handleShotRelease(animations, bar, ball, goal, shooting, contest)
+    barTween:Play()
+    wait(animationLength + 0.25)
+    cleanupBodyGyro(bg)
+    setPlayerWalkSpeed(humanoid, 16)
+    resetShotMeter(bar)
+end
+
+-- Shoot RemoteEvent connection
+remotes.Shoot.OnServerEvent:Connect(function(player, boolean, num)
+    local char, humanoid, root, ball, values, shooting, contest, animations = getCharacterComponents(player)
+    if not validateCharacterComponents(char, humanoid, root, ball, values, shooting, contest, animations) then return end
+    if num == 1 then
+        processStandingShot(player, char, humanoid, root, ball, values, shooting, contest, animations)
+    elseif num == 2 then
+        local _, stopTween = createTweens((setupShotMeter(root))[3], animations["Jumpshot-1"].Length)
+        stopTween:Play()
+    end
+end)
+
+Remotes.Guard.OnServerEvent:Connect(function(player, _, num)
+    local char, humanoid, root, _, values, _, _, animations = getCharacterComponents(player)
+    if not (char and humanoid and root and values and animations) then return end
+
+    local guarding = values:FindFirstChild("Guarding")
+    if not guarding then return end
+
+    if num == 1 then
+        local handler, handlerRoot = findBallHandler()
+        if handler and handlerRoot then
+            local distance = calculateDistance(root, handlerRoot)
+        end
+    end
+end)
